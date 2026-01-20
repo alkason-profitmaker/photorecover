@@ -15,6 +15,7 @@ init()
 
 from .enhancer import ImageEnhancer
 from .upscaler import AIUpscaler
+from .recovery import SDCardRecovery
 
 
 def print_banner():
@@ -64,13 +65,15 @@ def print_warning(message: str):
 
 
 @click.group()
-@click.version_option(version="1.0.0", prog_name="PhotoRecover")
+@click.version_option(version="1.1.0", prog_name="PhotoRecover")
 def cli():
     """
-    PhotoRecover - Enhance blurry recovered images to HD/4K quality.
+    PhotoRecover - Recover and enhance images from formatted SD cards.
 
-    Recover your precious memories from formatted SD cards with professional
-    quality enhancement and AI-powered upscaling.
+    Complete solution for:
+    1. Recovering JPEG images from formatted/corrupted SD cards
+    2. Removing duplicates and validating recovered images
+    3. Enhancing blurry images to HD/4K quality with AI upscaling
     """
     pass
 
@@ -424,6 +427,206 @@ def batch(input_dir, output_dir, quality):
     ctx.invoke(enhance, input_path=input_dir, output_path=output_dir,
                scale='4', quality=quality, denoise=8, sharpen=1.2,
                contrast=2.0, ai=True, gpu=0, format=None)
+
+
+@cli.command()
+@click.argument('source', type=click.Path(exists=True))
+@click.argument('output_dir', type=click.Path())
+@click.option('--min-size', '-m', default=10, type=int,
+              help='Minimum image size in KB (default: 10)')
+@click.option('--max-size', '-M', default=50, type=int,
+              help='Maximum image size in MB (default: 50)')
+@click.option('--no-validate', is_flag=True,
+              help='Skip image validation (faster but may include corrupt images)')
+@click.option('--no-dedupe', is_flag=True,
+              help='Do not skip duplicate images')
+@click.option('--enhance', '-e', is_flag=True,
+              help='Also enhance recovered images to 4K after recovery')
+@click.option('--quality', '-q', default='high',
+              type=click.Choice(['fast', 'balanced', 'high', 'ultra']),
+              help='Enhancement quality (only used with --enhance)')
+def recover(source, output_dir, min_size, max_size, no_validate, no_dedupe, enhance, quality):
+    """
+    Recover JPEG images from a formatted SD card or disk image.
+
+    This command scans raw storage for JPEG file signatures and extracts
+    complete, valid images while automatically removing duplicates.
+
+    SOURCE: Path to SD card device (e.g., /dev/sdb) or disk image file
+    OUTPUT_DIR: Directory to save recovered images
+
+    Examples:
+
+        # Recover from SD card (Linux - run as root)
+        sudo photorecover recover /dev/sdb ./recovered/
+
+        # Recover from disk image file
+        photorecover recover sdcard.img ./recovered/
+
+        # Recover and enhance to 4K in one step
+        photorecover recover sdcard.img ./recovered/ --enhance --quality ultra
+
+        # Quick recovery without validation
+        photorecover recover /dev/sdb ./recovered/ --no-validate
+
+    Notes:
+
+        On Linux, you may need root access to read raw devices:
+            sudo photorecover recover /dev/sdb ./recovered/
+
+        On Windows, use disk image files or tools like Win32DiskImager to
+        create an image of the SD card first.
+
+        To find your SD card device on Linux:
+            lsblk
+
+        To create a disk image:
+            sudo dd if=/dev/sdb of=sdcard.img bs=4M status=progress
+    """
+    print_banner()
+
+    source_path = Path(source)
+    output_path = Path(output_dir)
+
+    print_info(f"Source: {source_path}")
+    print_info(f"Output: {output_path}")
+    print_info(f"Settings: min={min_size}KB, max={max_size}MB, validate={'No' if no_validate else 'Yes'}, dedupe={'No' if no_dedupe else 'Yes'}")
+    print()
+
+    # Initialize recovery module
+    recovery = SDCardRecovery(
+        validate_images=not no_validate,
+        deduplicate=not no_dedupe,
+        min_size=min_size * 1024,  # Convert KB to bytes
+        max_size=max_size * 1024 * 1024,  # Convert MB to bytes
+        verbose=True
+    )
+
+    # Progress bar for large files
+    try:
+        total_size = source_path.stat().st_size
+        pbar = tqdm(total=total_size, unit='B', unit_scale=True, desc="Scanning")
+
+        def progress_callback(processed, total):
+            pbar.n = min(processed, total)
+            pbar.refresh()
+
+        # Run recovery
+        recovered_files = recovery.recover_from_file(
+            str(source_path),
+            str(output_path),
+            progress_callback=progress_callback
+        )
+
+        pbar.close()
+
+    except PermissionError:
+        print_error("Permission denied! Try running with sudo (Linux) or as Administrator (Windows)")
+        print_info("  Linux: sudo photorecover recover /dev/sdb ./recovered/")
+        return
+    except Exception as e:
+        print_error(f"Recovery failed: {e}")
+        return
+
+    if not recovered_files:
+        print_warning("No valid images were recovered.")
+        print_info("Tips:")
+        print_info("  - Try lowering --min-size (e.g., --min-size 1)")
+        print_info("  - Try --no-validate to include partially corrupt images")
+        print_info("  - Make sure the SD card hasn't been overwritten")
+        return
+
+    print()
+    print_success(f"Recovered {len(recovered_files)} images to {output_path}")
+
+    # Optionally enhance recovered images
+    if enhance:
+        print()
+        print_info("Starting image enhancement...")
+
+        enhanced_dir = output_path / "enhanced_4k"
+        enhanced_dir.mkdir(parents=True, exist_ok=True)
+
+        # Quality presets
+        presets = {
+            'fast': {'denoise': 5, 'sharpen': 0.8, 'contrast': 1.5},
+            'balanced': {'denoise': 8, 'sharpen': 1.0, 'contrast': 2.0},
+            'high': {'denoise': 10, 'sharpen': 1.2, 'contrast': 2.0},
+            'ultra': {'denoise': 12, 'sharpen': 1.5, 'contrast': 2.5}
+        }
+        preset = presets[quality]
+
+        enhancer = ImageEnhancer()
+        upscaler = AIUpscaler(gpu_id=0)
+
+        status = upscaler.get_status()
+        if status['ai_available']:
+            print_success(f"AI upscaling enabled")
+        else:
+            print_warning("Using fallback upscaling (AI not available)")
+
+        success_count = 0
+        for img_path in tqdm(recovered_files, desc="Enhancing images", unit="img"):
+            try:
+                img_path = Path(img_path)
+                image = enhancer.load_image(img_path)
+
+                # Apply enhancement pipeline
+                enhanced = enhancer.full_enhancement_pipeline(
+                    image,
+                    denoise_strength=preset['denoise'],
+                    sharpen_strength=preset['sharpen'],
+                    contrast_clip=preset['contrast'],
+                    upscale=1
+                )
+
+                # AI upscale
+                enhanced = upscaler.upscale(enhanced, scale=4)
+
+                # Save
+                out_file = enhanced_dir / f"{img_path.stem}_4k.jpg"
+                enhancer.save_image(enhanced, out_file, quality=95)
+                success_count += 1
+
+            except Exception as e:
+                tqdm.write(f"  Failed to enhance {img_path.name}: {e}")
+
+        print()
+        print_success(f"Enhanced {success_count}/{len(recovered_files)} images to 4K")
+        print_info(f"Enhanced images saved to: {enhanced_dir}")
+
+
+@cli.command()
+@click.argument('source', type=click.Path(exists=True))
+@click.argument('output_dir', type=click.Path())
+@click.option('--quality', '-q', default='ultra',
+              type=click.Choice(['fast', 'balanced', 'high', 'ultra']),
+              help='Enhancement quality preset')
+def full_recovery(source, output_dir, quality):
+    """
+    Complete recovery pipeline: recover images and enhance to 4K.
+
+    This is a convenience command that combines recovery and enhancement
+    in a single step for the best results.
+
+    SOURCE: Path to SD card device or disk image
+    OUTPUT_DIR: Directory to save all output
+
+    The command will create two subdirectories:
+        - recovered/    - Original recovered images
+        - enhanced_4k/  - 4K enhanced versions
+
+    Examples:
+
+        photorecover full-recovery sdcard.img ./output/ --quality ultra
+
+        sudo photorecover full-recovery /dev/sdb ./output/
+    """
+    # Simply call recover with --enhance flag
+    ctx = click.Context(recover)
+    ctx.invoke(recover, source=source, output_dir=output_dir,
+               min_size=10, max_size=50, no_validate=False,
+               no_dedupe=False, enhance=True, quality=quality)
 
 
 def main():
