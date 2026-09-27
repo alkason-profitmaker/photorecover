@@ -5,7 +5,7 @@ Includes denoising, deblurring, contrast enhancement, white balance, and quality
 
 import cv2
 import numpy as np
-from PIL import Image, ImageEnhance, ImageFilter
+from PIL import Image, ImageEnhance, ImageFilter, ImageOps
 from scipy import ndimage
 from typing import Optional, Tuple, Union, Dict, Any
 from pathlib import Path
@@ -23,7 +23,7 @@ class ImageEnhancer:
         self.face_cascade = cv2.CascadeClassifier(cascade_file) if Path(cascade_file).exists() else None
 
     def load_image(self, image_path: Union[str, Path]) -> np.ndarray:
-        """Loads an image from file and returns RGB numpy array."""
+        """Loads an image from file, auto-transposes EXIF orientation, and returns RGB numpy array."""
         image_path = Path(image_path)
         if not image_path.exists():
             raise FileNotFoundError(f"Image not found: {image_path}")
@@ -31,29 +31,74 @@ class ImageEnhancer:
         if image_path.suffix.lower() not in self.supported_formats:
             raise ValueError(f"Unsupported format: {image_path.suffix}")
 
-        image = cv2.imread(str(image_path))
-        if image is None:
-            # Fallback to PIL in case OpenCV fails on certain color profiles
-            pil_img = Image.open(image_path)
-            return np.array(pil_img.convert("RGB"))
+        try:
+            with Image.open(image_path) as pil_img:
+                # Auto-rotate according to camera EXIF orientation tag (e.g. portrait photos)
+                transposed = ImageOps.exif_transpose(pil_img)
+                return np.array(transposed.convert("RGB"))
+        except Exception:
+            # Fallback to OpenCV if PIL encounters non-standard stream
+            image = cv2.imread(str(image_path))
+            if image is None:
+                raise ValueError(f"Could not decode image at {image_path}")
+            return cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
-        return cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-
-    def save_image(self, image: np.ndarray, output_path: Union[str, Path], quality: int = 95):
-        """Saves an image to disk with optimal compression."""
+    def save_image(self,
+                   image: np.ndarray,
+                   output_path: Union[str, Path],
+                   quality: int = 95,
+                   source_path: Optional[Union[str, Path]] = None):
+        """Saves an image to disk with optimal compression and preserved EXIF/ICC profiles."""
         output_path = Path(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
-        image_bgr = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+        exif_bytes = None
+        icc_profile = None
+        if source_path:
+            try:
+                with Image.open(source_path) as orig:
+                    exif_bytes = orig.info.get("exif")
+                    icc_profile = orig.info.get("icc_profile")
+            except Exception:
+                pass
 
-        if output_path.suffix.lower() in {'.jpg', '.jpeg'}:
-            cv2.imwrite(str(output_path), image_bgr, [cv2.IMWRITE_JPEG_QUALITY, quality])
-        elif output_path.suffix.lower() == '.png':
-            cv2.imwrite(str(output_path), image_bgr, [cv2.IMWRITE_PNG_COMPRESSION, 3])
-        elif output_path.suffix.lower() == '.webp':
-            cv2.imwrite(str(output_path), image_bgr, [cv2.IMWRITE_WEBP_QUALITY, quality])
+        ext = output_path.suffix.lower()
+        if ext in {'.jpg', '.jpeg', '.png', '.webp'} and (exif_bytes or icc_profile):
+            # Use PIL to embed ICC and EXIF profiles
+            pil_img = Image.fromarray(image)
+            save_kwargs = {}
+            if exif_bytes:
+                save_kwargs["exif"] = exif_bytes
+            if icc_profile:
+                save_kwargs["icc_profile"] = icc_profile
+
+            if ext in {'.jpg', '.jpeg'}:
+                pil_img.save(output_path, format="JPEG", quality=quality, optimize=True, **save_kwargs)
+            elif ext == '.png':
+                pil_img.save(output_path, format="PNG", optimize=True, **save_kwargs)
+            elif ext == '.webp':
+                pil_img.save(output_path, format="WEBP", quality=quality, **save_kwargs)
         else:
-            cv2.imwrite(str(output_path), image_bgr)
+            image_bgr = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+            if ext in {'.jpg', '.jpeg'}:
+                cv2.imwrite(str(output_path), image_bgr, [cv2.IMWRITE_JPEG_QUALITY, quality])
+            elif ext == '.png':
+                cv2.imwrite(str(output_path), image_bgr, [cv2.IMWRITE_PNG_COMPRESSION, 3])
+            elif ext == '.webp':
+                cv2.imwrite(str(output_path), image_bgr, [cv2.IMWRITE_WEBP_QUALITY, quality])
+            else:
+                cv2.imwrite(str(output_path), image_bgr)
+
+    def upscale_long_edge(self, image: np.ndarray, long_edge: int = 3840) -> np.ndarray:
+        """Scales image so its longest dimension reaches long_edge, preserving aspect ratio."""
+        h, w = image.shape[:2]
+        current = max(w, h)
+        if current >= long_edge:
+            return image.copy()
+        scale = long_edge / current
+        new_w = max(1, int(round(w * scale)))
+        new_h = max(1, int(round(h * scale)))
+        return cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)
 
     def assess_quality(self, image: np.ndarray) -> Dict[str, Any]:
         """

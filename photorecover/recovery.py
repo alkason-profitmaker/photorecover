@@ -415,10 +415,12 @@ class SDCardRecovery:
             file_path = output_dir / f"{stem}_{count:05d}{ext_suffix}"
             filename = file_path.name
 
-        with open(file_path, "wb") as f:
+        tmp_file = file_path.with_name(f".{file_path.name}.partial")
+        with open(tmp_file, "wb") as f:
             f.write(data)
             f.flush()
             os.fsync(f.fileno())
+        os.replace(tmp_file, file_path)
 
         # Thumbnail and EXIF
         thumb_bytes = self._generate_thumbnail(data)

@@ -58,8 +58,8 @@ class AIUpscaler:
                 scale=netscale,
                 model_path=str(model_path),
                 model=model,
-                tile=0,
-                tile_pad=10,
+                tile=256,       # Safe tiling prevents CUDA Out-Of-Memory on consumer GPUs
+                tile_pad=16,
                 pre_pad=0,
                 half=False,
                 gpu_id=self.gpu_id
@@ -158,6 +158,27 @@ class AIUpscaler:
         while strictly preserving the photograph's original aspect ratio.
         """
         return self.upscale_to_resolution(image, target_width=3840, target_height=2160, maintain_aspect=True)
+
+    def upscale_long_edge(self, image: np.ndarray, long_edge: int = 3840) -> np.ndarray:
+        """
+        Scales image so its longest dimension reaches long_edge,
+        combining AI or Lanczos-4 while preserving original aspect ratio.
+        """
+        h, w = image.shape[:2]
+        current = max(w, h)
+        if current >= long_edge:
+            return image.copy()
+        scale = long_edge / current
+        if scale <= 4.0:
+            return self.upscale(image, scale=int(np.ceil(scale)), outscale=scale)
+
+        # One 4x pass followed by clean Lanczos-4 prevents hallucination artifacts
+        first_pass = self.upscale(image, scale=4, outscale=4.0)
+        h2, w2 = first_pass.shape[:2]
+        final_scale = long_edge / max(w2, h2)
+        if final_scale <= 1.0:
+            return first_pass
+        return cv2.resize(first_pass, (int(round(w2 * final_scale)), int(round(h2 * final_scale))), interpolation=cv2.INTER_LANCZOS4)
 
     @staticmethod
     def get_available_models() -> list:

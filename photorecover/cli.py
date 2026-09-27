@@ -91,15 +91,30 @@ def cli():
 @cli.command()
 @click.option('--port', '-p', default=8765, type=int, help='Local server port (default 8765)')
 @click.option('--no-browser', is_flag=True, help='Do not launch browser automatically')
-def ui(port, no_browser):
+@click.option('--desktop', is_flag=True, help='Launch native zero-browser Tkinter desktop window instead')
+def ui(port, no_browser, desktop):
     """
-    Launch interactive Web GUI Workstation with thumbnail preview.
+    Launch interactive GUI Workstation with thumbnail preview.
 
-    Starts a fast local server and opens your browser to review photos,
-    filter by type, compare before/after AI restoration, and recover selectively.
+    Default: launches modern local Web Workstation (split Before/After sliders).
+    --desktop: launches lightweight native Tkinter desktop window.
     """
     print_banner()
-    start_server(port=port, open_browser=not no_browser)
+    if desktop:
+        from .desktop import launch_desktop
+        launch_desktop()
+    else:
+        start_server(port=port, open_browser=not no_browser)
+
+
+@cli.command('desktop')
+def desktop_cmd():
+    """
+    Launch lightweight native Tkinter desktop application (no web browser needed).
+    """
+    print_banner()
+    from .desktop import launch_desktop
+    launch_desktop()
 
 
 @cli.command()
