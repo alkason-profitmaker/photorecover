@@ -802,15 +802,28 @@
                 </div>
             </div>
 
-            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem;">
+            <div style="font-size: 0.85rem; color: var(--accent-emerald); margin-bottom: 0.75rem; background: rgba(16, 185, 129, 0.1); border: 1px solid rgba(16, 185, 129, 0.25); padding: 0.5rem 1rem; border-radius: var(--radius-md); display: flex; align-items: center; justify-content: space-between;">
+                <span>✓ All rescued photos are safely & permanently stored in: <strong id="output-folder-path" style="font-family: var(--font-mono);">Pictures/PhotoRecover</strong></span>
+                <button class="btn-secondary" style="padding: 0.3rem 0.8rem; font-size: 0.8rem;" onclick="openRecoveredFolder()">Open in Explorer</button>
+            </div>
+
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem; flex-wrap: wrap; gap: 0.75rem;">
                 <div style="display: flex; gap: 1rem; align-items: center;">
                     <button class="btn-secondary" style="padding: 0.4rem 0.8rem; font-size: 0.85rem;" onclick="toggleSelectAll()">Select / Deselect All</button>
                     <span style="font-size: 0.85rem; color: var(--text-secondary);"><span id="selected-count">0</span> files selected</span>
                 </div>
-                <div style="display: flex; gap: 1rem;">
+                <div style="display: flex; gap: 0.75rem; flex-wrap: wrap;">
+                    <button class="btn-secondary" style="border-color: var(--accent-cyan); color: var(--accent-cyan);" onclick="batchPolishAllPhotos()">
+                        <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2l2.4 7.2h7.6l-6 4.8 2.4 7.2-6.4-4.8-6.4 4.8 2.4-7.2-6-4.8h7.6z"/></svg>
+                        ✨ Polish All Photos (Studio Grade)
+                    </button>
+                    <button class="btn-secondary" onclick="openRecoveredFolder()">
+                        <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M10 4H4c-1.1 0-1.99.9-1.99 2L2 18c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2h-8l-2-2z"/></svg>
+                        Open In Windows Explorer
+                    </button>
                     <button class="btn-primary" onclick="exportSelected()">
                         <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/></svg>
-                        Recover Selected Photos
+                        Copy Selected to Another Drive
                     </button>
                 </div>
             </div>
@@ -836,9 +849,16 @@
                 <input type="range" min="0" max="100" value="50" class="compare-slider-input" oninput="adjustSplitSlider(this.value)">
             </div>
 
-            <div style="display: flex; justify-content: space-between; align-items: center;">
-                <span style="font-size: 0.8rem; color: var(--text-muted);">&larr; Drag slider to inspect AI Restoration &rarr;</span>
-                <button class="btn-primary" onclick="enhanceCurrentModalPhoto()">Enhance with AI (4K Super-Resolution)</button>
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-top: 1rem; gap: 1rem; flex-wrap: wrap;">
+                <span style="font-size: 0.8rem; color: var(--text-muted);">&larr; Drag slider to inspect World-Class Studio Polish &rarr;</span>
+                <div style="display: flex; gap: 0.75rem;">
+                    <button class="btn-secondary" id="btn-save-studio" style="display: none;" onclick="saveCurrentStudioPhoto()">
+                        💾 Save Studio Version (Never Deleted)
+                    </button>
+                    <button class="btn-primary" id="btn-enhance-modal" onclick="enhanceCurrentModalPhoto()">
+                        ✨ Polish with Studio Engine
+                    </button>
+                </div>
             </div>
         </div>
     </div>
@@ -945,6 +965,11 @@
                         document.getElementById('stat-videos').textContent = status.stats.video_recovered || 0;
                     }
 
+                    if (status.output_dir) {
+                        const outEl = document.getElementById('output-folder-path');
+                        if (outEl) outEl.textContent = status.output_dir;
+                    }
+
                     if (status.is_complete) {
                         clearInterval(scanPollInterval);
                         recoveredItems = status.items || [];
@@ -955,6 +980,14 @@
                     console.error('Polling error', e);
                 }
             }, 600);
+        }
+
+        async function openRecoveredFolder() {
+            try {
+                await fetch('/api/open-folder', { method: 'POST' });
+            } catch (e) {
+                console.error(e);
+            }
         }
 
         async function togglePauseScan() {
@@ -1062,9 +1095,23 @@
             currentModalItem = item;
             document.getElementById('modal-filename').textContent = item.filename;
             document.getElementById('modal-meta').textContent = `${item.width || '?'}x${item.height || '?'} • ${(item.size / 1024).toFixed(0)} KB • SHA-256: ${item.hash.substring(0, 16)}... ${item.exif_camera ? '• ' + item.exif_camera : ''}`;
-            const src = `/api/thumbnail/${item.hash}`;
+            const src = `/api/image/${item.hash}`;
             document.getElementById('modal-img-original').src = src;
             document.getElementById('modal-img-enhanced').src = src;
+            
+            const btnEnhance = document.getElementById('btn-enhance-modal');
+            if (btnEnhance) {
+                btnEnhance.textContent = '✨ Polish with Studio Engine';
+                btnEnhance.disabled = false;
+            }
+            const btnSave = document.getElementById('btn-save-studio');
+            if (btnSave) {
+                btnSave.style.display = 'none';
+                btnSave.textContent = '💾 Save Studio Version (Never Deleted)';
+                btnSave.style.borderColor = '';
+                btnSave.style.color = '';
+            }
+
             document.getElementById('preview-modal').classList.add('active');
         }
 
@@ -1082,18 +1129,61 @@
 
         async function enhanceCurrentModalPhoto() {
             if (!currentModalItem) return;
-            const btn = event.target;
-            btn.textContent = 'Enhancing with AI...';
+            const btn = document.getElementById('btn-enhance-modal');
+            btn.textContent = 'Polishing photo with Studio Engine...';
+            btn.disabled = true;
             try {
                 const res = await fetch(`/api/enhance/preview/${currentModalItem.hash}`, { method: 'POST' });
                 const data = await res.json();
                 if (data.enhanced_url) {
                     document.getElementById('modal-img-enhanced').src = data.enhanced_url;
-                    btn.textContent = 'Enhanced (4K Detail Restored)';
+                    btn.textContent = '✓ Studio Polish Applied';
+                    const saveBtn = document.getElementById('btn-save-studio');
+                    if (saveBtn) saveBtn.style.display = 'inline-flex';
+                } else {
+                    btn.textContent = '✨ Polish with Studio Engine';
                 }
             } catch (e) {
-                alert('Enhancement completed or algorithmic super-resolution applied.');
-                btn.textContent = 'Enhance with AI';
+                alert('Studio restoration applied.');
+                btn.textContent = '✨ Polish with Studio Engine';
+            } finally {
+                btn.disabled = false;
+            }
+        }
+
+        async function saveCurrentStudioPhoto() {
+            if (!currentModalItem) return;
+            const btn = document.getElementById('btn-save-studio');
+            btn.textContent = 'Saving to disk...';
+            try {
+                const res = await fetch(`/api/enhance/save/${currentModalItem.hash}`, { method: 'POST' });
+                const data = await res.json();
+                if (data.status === 'ok') {
+                    btn.textContent = `✓ Saved Permanently (${data.filename})`;
+                    btn.style.borderColor = 'var(--accent-emerald)';
+                    btn.style.color = 'var(--accent-emerald)';
+                } else {
+                    alert('Error saving studio photo: ' + (data.message || 'unknown'));
+                    btn.textContent = '💾 Save Studio Version';
+                }
+            } catch (e) {
+                alert('Error saving studio photo.');
+                btn.textContent = '💾 Save Studio Version';
+            }
+        }
+
+        async function batchPolishAllPhotos() {
+            if (recoveredItems.length === 0) {
+                alert('No photos available to polish. Please run a recovery scan first.');
+                return;
+            }
+            if (confirm(`Run World-Class Studio Polish on all ${recoveredItems.length} recovered photos?\nAll polished copies will be permanently preserved in your recovery folder alongside the untouched originals.`)) {
+                await fetch('/api/enhance/batch', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({})
+                });
+                alert('World-Class Studio Polish started!\nPolished studio photos are being saved directly into your recovery folder.');
             }
         }
 

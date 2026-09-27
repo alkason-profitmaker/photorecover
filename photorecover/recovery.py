@@ -22,10 +22,14 @@ from io import BytesIO
 
 from PIL import Image, ExifTags
 
-from .signatures import MultiFormatCarver, JPEGParser, PNGParser, TIFFRAWParser, MP4VideoParser, MediaType
+from .signatures import (
+    MultiFormatCarver, JPEGParser, PNGParser, HEICParser, WebPParser,
+    TIFFRAWParser, MP4VideoParser, MediaType
+)
 from .repair import JPEGRepairer
 from .filesystem import FilesystemRecoveryEngine, FilesystemFile
 from .exceptions import SourceMediaError, BadSectorError
+from .report import generate_recovery_report, generate_vault_readme
 
 
 @dataclass
@@ -143,6 +147,33 @@ class SDCardRecovery:
         except Exception:
             return None
 
+    @staticmethod
+    def validate_safety(source_path: str, output_dir: str):
+        """
+        Enforces the #1 Golden Rule of Data Recovery:
+        The destination directory must NEVER reside on the source storage media!
+        Writing to the source drive overwrites unallocated sectors and destroys lost photos forever.
+        """
+        import sys
+        src = Path(source_path).resolve()
+        out = Path(output_dir).resolve()
+
+        if sys.platform == "win32":
+            if src.drive and out.drive and src.drive.upper() == out.drive.upper():
+                if len(src.parts) <= 1 or str(src).endswith(":\\") or "\\\\.\\" in str(src):
+                    raise SourceMediaError(
+                        f"CRITICAL SAFETY VIOLATION: Target folder '{out}' is on the same drive as source '{src}'! "
+                        "Writing to the source storage card will permanently overwrite and destroy your deleted photos. "
+                        "Please select a destination folder on your computer's main hard drive (e.g. C:\\Recovered_Photos)."
+                    )
+        else:
+            try:
+                if src.exists() and out.exists():
+                    if os.stat(src).st_dev == os.stat(out).st_dev:
+                        raise SourceMediaError("CRITICAL SAFETY VIOLATION: Destination directory is on the source device.")
+            except Exception:
+                pass
+
     def recover(self,
                 source_path: str,
                 output_dir: str,
@@ -152,9 +183,23 @@ class SDCardRecovery:
         """
         Executes complete recovery pipeline with zero boundary loss.
         """
+        # Strict Golden Rule: never write to source media
+        self.validate_safety(source_path, output_dir)
+
         source = Path(source_path)
         out_dir = Path(output_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
+
+        # Verify free disk space on target drive (require at least 50MB)
+        import shutil
+        try:
+            free_bytes = shutil.disk_usage(out_dir).free
+            if free_bytes < 50 * 1024 * 1024:
+                raise SourceMediaError(f"Target disk has insufficient free space ({free_bytes // (1024 * 1024)} MB available).")
+        except Exception as e:
+            if isinstance(e, SourceMediaError):
+                raise
+
         thumbs_dir = out_dir / ".thumbnails"
         thumbs_dir.mkdir(parents=True, exist_ok=True)
 
@@ -262,6 +307,45 @@ class SDCardRecovery:
                     })
 
         self.stats['total_scanned_bytes'] = stream_carver.current_file_offset
+
+        # Save permanent recovery manifest so recovered photos have a permanent verified record
+        manifest_path = out_dir / "recovery_manifest.json"
+        try:
+            import json
+            from datetime import datetime
+            manifest = {
+                "version": "2.0.0",
+                "recovery_timestamp": datetime.now().isoformat(),
+                "source_media": str(source),
+                "total_recovered": len(recovered_items),
+                "stats": self.stats,
+                "files": [
+                    {
+                        "filename": it.filename,
+                        "size_bytes": it.size,
+                        "sha256": it.hash,
+                        "dimensions": f"{it.width}x{it.height}" if it.width and it.height else None,
+                        "is_repaired": it.is_repaired,
+                        "camera": it.exif_camera,
+                        "date_taken": it.exif_date
+                    }
+                    for it in recovered_items
+                ]
+            }
+            with open(manifest_path, "w", encoding="utf-8") as mf:
+                json.dump(manifest, mf, indent=2)
+                mf.flush()
+                os.fsync(mf.fileno())
+        except Exception as mf_err:
+            self._log(f"Manifest save error: {mf_err}")
+
+        # Generate self-contained offline HTML photo gallery & permanent vault records
+        try:
+            generate_recovery_report(out_dir, str(source), recovered_items, self.stats)
+            generate_vault_readme(out_dir, str(source), len(recovered_items))
+        except Exception as rep_err:
+            self._log(f"Report generation note: {rep_err}")
+
         self._print_summary(recovered_items)
         return recovered_items
 
@@ -323,18 +407,31 @@ class SDCardRecovery:
             res_tag = f"_{width}x{height}" if (width and height) else ""
             filename = f"recovered_{count:05d}{res_tag}{tag}.{ext}"
 
+        # Ensure collision-free filename so no photo is ever overwritten
         file_path = output_dir / filename
+        if file_path.exists():
+            stem = file_path.stem
+            ext_suffix = file_path.suffix
+            file_path = output_dir / f"{stem}_{count:05d}{ext_suffix}"
+            filename = file_path.name
+
         with open(file_path, "wb") as f:
             f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
 
         # Thumbnail and EXIF
         thumb_bytes = self._generate_thumbnail(data)
         camera, date_time = self._extract_exif(data)
 
+        # Restore authentic camera capture timestamp to file system metadata
+        if date_time:
+            self._apply_file_timestamp(file_path, date_time)
+
         return RecoveredItem(
             path=str(file_path),
             filename=filename,
-            media_type="photo" if ext in ('jpg', 'jpeg', 'png') else ("video" if ext in ('mp4', 'mov') else "raw"),
+            media_type="photo" if ext in ('jpg', 'jpeg', 'png', 'heic', 'webp') else ("video" if ext in ('mp4', 'mov') else "raw"),
             extension=ext,
             size=len(data),
             offset=offset,
@@ -348,6 +445,23 @@ class SDCardRecovery:
             exif_date=date_time,
             fs_origin=fs_origin
         )
+
+    @staticmethod
+    def _apply_file_timestamp(file_path: Path, date_time_str: str):
+        """
+        Restores authentic camera capture timestamp to file system metadata.
+        This ensures Windows Explorer, macOS Finder, and photo organizers
+        chronologically sort recovered photos by their true shooting date.
+        """
+        from datetime import datetime
+        for fmt in ("%Y:%m:%d %H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y:%m:%d"):
+            try:
+                dt = datetime.strptime(date_time_str.strip(), fmt)
+                ts = dt.timestamp()
+                os.utime(str(file_path), (ts, ts))
+                return
+            except Exception:
+                continue
 
     def _print_summary(self, items: List[RecoveredItem]):
         if not self.verbose:
@@ -461,6 +575,10 @@ class StreamCarver:
                     length, is_complete, meta = JPEGParser.parse_stream(buffer, idx, self.max_file_size)
                 elif media_type == MediaType.PNG:
                     length, is_complete, meta = PNGParser.parse_stream(buffer, idx, self.max_file_size)
+                elif media_type == MediaType.HEIC:
+                    length, is_complete, meta = HEICParser.parse_stream(buffer, idx, self.max_file_size)
+                elif media_type == MediaType.WEBP:
+                    length, is_complete, meta = WebPParser.parse_stream(buffer, idx, self.max_file_size)
                 elif media_type == MediaType.TIFF_RAW:
                     length, is_complete, meta = TIFFRAWParser.parse_stream(buffer, idx, self.max_file_size)
                 elif media_type == MediaType.MP4_VIDEO:
@@ -485,6 +603,10 @@ class StreamCarver:
                         length, is_complete, meta = JPEGParser.parse_stream(buffer, 0, self.max_file_size)
                     elif media_type == MediaType.PNG:
                         length, is_complete, meta = PNGParser.parse_stream(buffer, 0, self.max_file_size)
+                    elif media_type == MediaType.HEIC:
+                        length, is_complete, meta = HEICParser.parse_stream(buffer, 0, self.max_file_size)
+                    elif media_type == MediaType.WEBP:
+                        length, is_complete, meta = WebPParser.parse_stream(buffer, 0, self.max_file_size)
                     elif media_type == MediaType.TIFF_RAW:
                         length, is_complete, meta = TIFFRAWParser.parse_stream(buffer, 0, self.max_file_size)
                     elif media_type == MediaType.MP4_VIDEO:

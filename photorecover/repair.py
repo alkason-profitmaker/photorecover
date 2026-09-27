@@ -93,7 +93,10 @@ class JPEGRepairer:
             # Test decode
             valid, w, h = cls._test_decode(bytes(repaired_buf))
             if valid:
-                return (bytes(repaired_buf), True, {
+                # Re-synthesize clean baseline JPEG for 100% universal viewer compatibility
+                clean_bytes = cls.synthesize_clean_jpeg(bytes(repaired_buf))
+                final_bytes = clean_bytes if clean_bytes else bytes(repaired_buf)
+                return (final_bytes, True, {
                     "width": w,
                     "height": h,
                     "repaired": True,
@@ -102,13 +105,16 @@ class JPEGRepairer:
 
         # Case 3: Scan data corrupted at end
         # Try trimming back in 1KB increments to find last decodeable raster block
-        for trim in (1024, 4096, 16384):
+        for trim in (1024, 4096, 16384, 65536):
             if len(data) > trim + 512:
                 candidate = bytearray(data[:-trim])
-                candidate.extend(cls.EOI)
+                if not candidate.endswith(cls.EOI):
+                    candidate.extend(cls.EOI)
                 valid, w, h = cls._test_decode(bytes(candidate))
                 if valid:
-                    return (bytes(candidate), True, {
+                    clean_bytes = cls.synthesize_clean_jpeg(bytes(candidate))
+                    final_bytes = clean_bytes if clean_bytes else bytes(candidate)
+                    return (final_bytes, True, {
                         "width": w,
                         "height": h,
                         "repaired": True,
@@ -116,6 +122,29 @@ class JPEGRepairer:
                     })
 
         return (None, False, {"error": "Unable to decode after repair attempts"})
+
+    @classmethod
+    def synthesize_clean_jpeg(cls, data: bytes, quality: int = 95) -> Optional[bytes]:
+        """
+        Re-synthesizes a 100% standards-compliant baseline JPEG from decodable raw/repaired bytes.
+        Ensures that truncated or salvaged frames render cleanly in any image viewer,
+        browser, or photo editing app without corrupt block or premature EOF warnings.
+        """
+        try:
+            with Image.open(BytesIO(data)) as img:
+                img.load()
+                rgb_img = img.convert("RGB") if img.mode != "RGB" else img
+                out_buf = BytesIO()
+                rgb_img.save(
+                    out_buf,
+                    format="JPEG",
+                    quality=quality,
+                    subsampling=0,
+                    optimize=True
+                )
+                return out_buf.getvalue()
+        except Exception:
+            return None
 
     @staticmethod
     def _test_decode(data: bytes) -> Tuple[bool, Optional[int], Optional[int]]:

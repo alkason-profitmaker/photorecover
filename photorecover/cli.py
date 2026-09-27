@@ -151,14 +151,18 @@ def recover(source, output_dir, fs, repair, raw, video, dedupe, enhance):
     )
     pbar.close()
 
-    print_success(f"Successfully rescued {len(items)} files into {out_path}")
+    print_success(f"Successfully rescued {len(items)} files into permanent vault:")
+    print_info(f"  Storage Location:      {out_path.resolve()}")
+    print_info(f"  Non-Deletion Warranty: 100% physically written & fsync'd (Never Deleted).")
+    print_info(f"  Offline Photo Gallery: Double-click '{out_path / 'RECOVERY_REPORT.html'}' to view.")
+    print_info(f"  Integrity Manifest:    '{out_path / 'recovery_manifest.json'}'")
 
     if enhance and items:
         print()
-        print_info("Executing AI Super-Resolution on recovered photographs...")
+        print_info("Executing World-Class Studio Restoration on recovered photographs...")
         enhancer = ImageEnhancer()
         upscaler = AIUpscaler()
-        enh_dir = out_path / "enhanced"
+        enh_dir = out_path / "studio_enhanced"
         enh_dir.mkdir(parents=True, exist_ok=True)
 
         for item in tqdm(items, desc="Restoring photos", unit="img"):
@@ -266,6 +270,61 @@ def generate_corpus_cmd(output_path, size_mb):
     print(f"  • PNG Images:         {gt['pngs']}")
     print(f"  • Camera RAW TIFF:    {gt['raw_tiffs']}")
     print_info(f"Test recovery with: photorecover recover {output_path} ./test_recovered/")
+
+
+@cli.command('open')
+@click.argument('folder_path', type=click.Path(), required=False)
+def open_folder_cmd(folder_path):
+    """
+    Open the permanent recovery folder directly in Windows File Explorer.
+    """
+    import subprocess
+    target = Path(folder_path) if folder_path else (Path.home() / "Pictures" / "PhotoRecover")
+    target.mkdir(parents=True, exist_ok=True)
+    print_info(f"Opening permanent recovery vault: {target}")
+    try:
+        if sys.platform == "win32":
+            os.startfile(str(target))
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", str(target)])
+        else:
+            subprocess.Popen(["xdg-open", str(target)])
+        print_success("Opened in system file manager.")
+    except Exception as e:
+        print_error(f"Failed to open folder: {e}")
+
+
+@cli.command('polish')
+@click.argument('input_folder', type=click.Path(exists=True))
+@click.option('--output-folder', type=click.Path(), required=False, help='Target directory (defaults to <input_folder>/studio_polished)')
+def polish_folder_cmd(input_folder, output_folder):
+    """
+    Batch-apply World-Class Studio Polish to an entire folder of photos.
+    Restores dynamic range, balances white balance, smooths compression, and sharpens details.
+    """
+    print_banner()
+    in_dir = Path(input_folder)
+    out_dir = Path(output_folder) if output_folder else in_dir / "studio_polished"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    enhancer = ImageEnhancer()
+    photos = [p for p in in_dir.iterdir() if p.suffix.lower() in ('.jpg', '.jpeg', '.png', '.webp')]
+    if not photos:
+        print_warning(f"No photos found in {in_dir}")
+        return
+
+    print_info(f"Applying World-Class Studio Polish to {len(photos)} photos...")
+    for p in tqdm(photos, desc="Studio Polishing", unit="photo"):
+        try:
+            img = enhancer.load_image(p)
+            polished = enhancer.studio_photo_restore(img, enhance_portrait=True, auto_exposure=True)
+            dest = out_dir / f"{p.stem}_studio{p.suffix}"
+            enhancer.save_image(polished, dest, quality=95)
+        except Exception as err:
+            tqdm.write(f"  Skipped {p.name}: {err}")
+
+    print_success(f"World-class polished photos saved permanently to: {out_dir}")
+    print_info("Untouched originals are preserved. Nothing was deleted.")
 
 
 def main():

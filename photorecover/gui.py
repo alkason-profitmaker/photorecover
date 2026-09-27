@@ -41,8 +41,10 @@ class ScanSessionManager:
         }
         self.recovered_items: List[RecoveredItem] = []
         self.item_by_hash: Dict[str, RecoveredItem] = {}
-        self.temp_output_dir = Path.home() / ".cache" / "photorecover" / "session"
-        self.temp_output_dir.mkdir(parents=True, exist_ok=True)
+        # Permanent safe storage directory (Windows Pictures / PhotoRecover)
+        self.base_output_dir = Path.home() / "Pictures" / "PhotoRecover"
+        self.base_output_dir.mkdir(parents=True, exist_ok=True)
+        self.current_output_dir = self.base_output_dir
 
     def start_scan(self, config: Dict[str, Any]):
         with self.lock:
@@ -62,6 +64,15 @@ class ScanSessionManager:
             include_raw = config.get("include_raw", True)
             include_video = config.get("include_video", True)
             dedupe = config.get("deduplicate", True)
+
+            custom_dest = config.get("destination", "").strip()
+            if custom_dest:
+                self.current_output_dir = Path(custom_dest)
+            else:
+                from datetime import datetime
+                timestamp_str = datetime.now().strftime('%Y%m%d_%H%M%S')
+                self.current_output_dir = self.base_output_dir / f"Session_{timestamp_str}"
+            self.current_output_dir.mkdir(parents=True, exist_ok=True)
 
             self.active_recovery = SDCardRecovery(
                 validate_images=True,
@@ -89,7 +100,7 @@ class ScanSessionManager:
 
                 items = self.active_recovery.recover(
                     source_path=source_path,
-                    output_dir=str(self.temp_output_dir),
+                    output_dir=str(self.current_output_dir),
                     scan_filesystem=scan_fs,
                     progress_callback=on_progress
                 )
@@ -144,7 +155,10 @@ class WebUIRequestHandler(BaseHTTPRequestHandler):
             self._handle_get_status()
         elif path.startswith("/api/thumbnail/"):
             img_hash = path.split("/")[-1]
-            self._handle_get_thumbnail(img_hash)
+            self._handle_get_thumbnail(img_hash, parsed.query)
+        elif path.startswith("/api/image/"):
+            img_hash = path.split("/")[-1]
+            self._handle_get_image(img_hash, parsed.query)
         else:
             self.send_error(404, "Not Found")
 
@@ -168,9 +182,16 @@ class WebUIRequestHandler(BaseHTTPRequestHandler):
             self._send_json({"status": "acknowledged"})
         elif path == "/api/recover/export":
             self._handle_export(data)
+        elif path == "/api/open-folder":
+            self._handle_open_folder()
         elif path.startswith("/api/enhance/preview/"):
             img_hash = path.split("/")[-1]
             self._handle_enhance_preview(img_hash)
+        elif path.startswith("/api/enhance/save/"):
+            img_hash = path.split("/")[-1]
+            self._handle_enhance_save(img_hash)
+        elif path == "/api/enhance/batch":
+            self._handle_enhance_batch(data)
         else:
             self.send_error(404, "Not Found")
 
@@ -247,11 +268,19 @@ class WebUIRequestHandler(BaseHTTPRequestHandler):
                 "total_bytes": session_manager.progress_data.get("total_bytes", 0),
                 "speed_mb": session_manager.progress_data.get("speed_mb", 0.0),
                 "stats": session_manager.progress_data.get("stats", {}),
+                "output_dir": str(session_manager.current_output_dir),
                 "items": items_payload
             }
         self._send_json(resp)
 
-    def _handle_get_thumbnail(self, img_hash: str):
+    def _handle_get_thumbnail(self, img_hash: str, query: str = ""):
+        if "enhanced=true" in query:
+            preview_file = session_manager.current_output_dir / "previews" / f"{img_hash}_enhanced.jpg"
+            if preview_file.exists():
+                data = preview_file.read_bytes()
+                self._send_image_bytes(data, "image/jpeg")
+                return
+
         item = session_manager.item_by_hash.get(img_hash)
         if not item:
             self.send_error(404, "Thumbnail not found")
@@ -267,10 +296,31 @@ class WebUIRequestHandler(BaseHTTPRequestHandler):
             self.send_error(404, "Image missing")
             return
 
+        self._send_image_bytes(data, content_type)
+
+    def _handle_get_image(self, img_hash: str, query: str = ""):
+        """Serves full resolution photo (original or studio-enhanced)."""
+        if "enhanced=true" in query:
+            preview_file = session_manager.current_output_dir / "previews" / f"{img_hash}_enhanced.jpg"
+            if preview_file.exists():
+                data = preview_file.read_bytes()
+                self._send_image_bytes(data, "image/jpeg")
+                return
+
+        item = session_manager.item_by_hash.get(img_hash)
+        if not item or not Path(item.path).exists():
+            self.send_error(404, "Photo not found")
+            return
+
+        data = Path(item.path).read_bytes()
+        content_type = "image/jpeg" if item.extension in ('jpg', 'jpeg') else f"image/{item.extension}"
+        self._send_image_bytes(data, content_type)
+
+    def _send_image_bytes(self, data: bytes, content_type: str):
         self.send_response(200)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(data)))
-        self.send_header("Cache-Control", "public, max-age=3600")
+        self.send_header("Cache-Control", "no-cache")
         self.end_headers()
         self.wfile.write(data)
 
@@ -290,6 +340,21 @@ class WebUIRequestHandler(BaseHTTPRequestHandler):
 
         self._send_json({"status": "success", "count": copied, "destination": str(destination)})
 
+    def _handle_open_folder(self):
+        folder = str(session_manager.current_output_dir)
+        try:
+            if sys.platform == "win32":
+                os.startfile(folder)
+            elif sys.platform == "darwin":
+                import subprocess
+                subprocess.Popen(["open", folder])
+            else:
+                import subprocess
+                subprocess.Popen(["xdg-open", folder])
+            self._send_json({"status": "ok", "path": folder})
+        except Exception as e:
+            self._send_json({"status": "error", "message": str(e)})
+
     def _handle_enhance_preview(self, img_hash: str):
         item = session_manager.item_by_hash.get(img_hash)
         if not item or not Path(item.path).exists():
@@ -298,18 +363,95 @@ class WebUIRequestHandler(BaseHTTPRequestHandler):
 
         try:
             enhancer = ImageEnhancer()
-            upscaler = AIUpscaler()
             img = enhancer.load_image(item.path)
-            enhanced = enhancer.full_enhancement_pipeline(img, denoise_strength=6, sharpen_strength=1.1, upscale=1.5)
+            # Apply our master world-class studio restoration pipeline!
+            enhanced = enhancer.studio_photo_restore(
+                img,
+                enhance_portrait=True,
+                auto_exposure=True,
+                denoise=True,
+                super_resolve_scale=1.5
+            )
 
-            out_dir = session_manager.temp_output_dir / "previews"
+            out_dir = session_manager.current_output_dir / "previews"
             out_dir.mkdir(parents=True, exist_ok=True)
             preview_path = out_dir / f"{img_hash}_enhanced.jpg"
-            enhancer.save_image(enhanced, preview_path, quality=90)
+            enhancer.save_image(enhanced, preview_path, quality=95)
 
-            self._send_json({"status": "ok", "enhanced_url": f"/api/thumbnail/{img_hash}"})
+            t_val = int(time.time() * 1000)
+            self._send_json({
+                "status": "ok",
+                "enhanced_url": f"/api/image/{img_hash}?enhanced=true&t={t_val}"
+            })
         except Exception as e:
             self._send_json({"status": "error", "message": str(e)})
+
+    def _handle_enhance_save(self, img_hash: str):
+        item = session_manager.item_by_hash.get(img_hash)
+        if not item:
+            self.send_error(404, "Image not found")
+            return
+
+        preview_file = session_manager.current_output_dir / "previews" / f"{img_hash}_enhanced.jpg"
+        if not preview_file.exists():
+            self._send_json({"status": "error", "message": "Enhanced preview not yet generated"})
+            return
+
+        try:
+            stem = Path(item.filename).stem
+            studio_filename = f"{stem}_studio.jpg"
+            studio_path = session_manager.current_output_dir / studio_filename
+
+            # Never overwrite! If exists, append counter
+            count = 1
+            while studio_path.exists():
+                studio_path = session_manager.current_output_dir / f"{stem}_studio_{count}.jpg"
+                studio_filename = studio_path.name
+                count += 1
+
+            shutil.copy2(preview_file, studio_path)
+
+            # Flush to disk for permanent non-deletion guarantee
+            with open(studio_path, "ab") as f:
+                f.flush()
+                os.fsync(f.fileno())
+
+            self._send_json({
+                "status": "ok",
+                "filename": studio_filename,
+                "path": str(studio_path)
+            })
+        except Exception as e:
+            self._send_json({"status": "error", "message": str(e)})
+
+    def _handle_enhance_batch(self, data: Dict[str, Any]):
+        hashes = data.get("hashes", [])
+        if not hashes:
+            with session_manager.lock:
+                hashes = [it.hash for it in session_manager.recovered_items if it.media_type == "photo"]
+
+        def run_batch():
+            enhancer = ImageEnhancer()
+            for h in hashes:
+                it = session_manager.item_by_hash.get(h)
+                if not it or not Path(it.path).exists():
+                    continue
+                try:
+                    stem = Path(it.filename).stem
+                    out_name = f"{stem}_studio.jpg"
+                    dest = session_manager.current_output_dir / out_name
+                    if not dest.exists():
+                        img = enhancer.load_image(it.path)
+                        enhanced = enhancer.studio_photo_restore(img)
+                        enhancer.save_image(enhanced, dest, quality=95)
+                        with open(dest, "ab") as f:
+                            f.flush()
+                            os.fsync(f.fileno())
+                except Exception:
+                    pass
+
+        threading.Thread(target=run_batch, daemon=True).start()
+        self._send_json({"status": "ok", "message": f"Studio enhancement started for {len(hashes)} photos."})
 
 
 def start_server(port: int = 8765, open_browser: bool = True):

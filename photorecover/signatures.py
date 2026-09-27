@@ -12,9 +12,10 @@ from enum import Enum
 class MediaType(str, Enum):
     JPEG = "jpeg"
     PNG = "png"
+    HEIC = "heic"
+    WEBP = "webp"
     TIFF_RAW = "raw_tiff"
     MP4_VIDEO = "video_mp4"
-    WEBP = "webp"
     GIF = "gif"
     UNKNOWN = "unknown"
 
@@ -278,13 +279,103 @@ class TIFFRAWParser:
         return (estimated_size if estimated_size > 2048 else None, True, metadata)
 
 
+class HEICParser:
+    """
+    Carver for High Efficiency Image Format (HEIC/HEIF) photographs.
+    Compatible with iPhone (iOS 11+), Android, and modern digital cameras.
+    Signatures: ftyp with major brand or compatible brands:
+    heic, heix, heim, heis, mif1, msf1, hevc
+    """
+    FTYP = b'ftyp'
+    HEIC_BRANDS = {
+        b'heic', b'heix', b'heim', b'heis', b'mif1', b'msf1', b'hevc'
+    }
+
+    @classmethod
+    def is_valid_header(cls, data: bytes, offset: int = 0) -> bool:
+        if len(data) - offset < 16:
+            return False
+        if data[offset + 4:offset + 8] != cls.FTYP:
+            return False
+        major_brand = data[offset + 8:offset + 12]
+        if major_brand in cls.HEIC_BRANDS:
+            return True
+        # Check compatible brands in the rest of ftyp box
+        ftyp_len = struct.unpack(">I", data[offset:offset + 4])[0]
+        if 16 <= ftyp_len <= 128 and len(data) - offset >= ftyp_len:
+            compat_data = data[offset + 16:offset + ftyp_len]
+            for i in range(0, len(compat_data), 4):
+                if compat_data[i:i + 4] in cls.HEIC_BRANDS:
+                    return True
+        return False
+
+    @classmethod
+    def parse_stream(cls, data: bytes, start: int, max_size: int = 100 * 1024 * 1024) -> Tuple[Optional[int], bool, Dict[str, Any]]:
+        limit = min(start + max_size, len(data))
+        pos = start
+        has_meta = False
+        has_mdat = False
+
+        while pos + 8 <= limit:
+            box_len = struct.unpack(">I", data[pos:pos + 4])[0]
+            box_type = data[pos + 4:pos + 8]
+
+            if box_len == 1:
+                if pos + 16 > limit:
+                    break
+                box_len = struct.unpack(">Q", data[pos + 8:pos + 16])[0]
+            elif box_len == 0:
+                box_len = limit - pos
+
+            if box_len < 8:
+                break
+
+            if box_type == b'meta':
+                has_meta = True
+            elif box_type == b'mdat':
+                has_mdat = True
+
+            pos += box_len
+
+            if has_meta and has_mdat:
+                return (pos - start, True, {"photo_type": "heic"})
+
+        total = pos - start
+        if total > 8192 and (has_meta or has_mdat):
+            return (total, False, {"photo_type": "heic", "partial": True})
+        return (None, False, {})
+
+
+class WebPParser:
+    """WebP image container carver (Signature: RIFF....WEBP)."""
+
+    @classmethod
+    def is_valid_header(cls, data: bytes, offset: int = 0) -> bool:
+        if len(data) - offset < 12:
+            return False
+        return data[offset:offset + 4] == b'RIFF' and data[offset + 8:offset + 12] == b'WEBP'
+
+    @classmethod
+    def parse_stream(cls, data: bytes, start: int, max_size: int = 50 * 1024 * 1024) -> Tuple[Optional[int], bool, Dict[str, Any]]:
+        limit = min(start + max_size, len(data))
+        if limit - start < 12:
+            return (None, False, {})
+        riff_len = struct.unpack("<I", data[start + 4:start + 8])[0]
+        total_len = riff_len + 8
+        if total_len > max_size or total_len < 16:
+            return (None, False, {})
+        if start + total_len <= len(data):
+            return (total_len, True, {"photo_type": "webp"})
+        return (len(data) - start, False, {"photo_type": "webp", "partial": True})
+
+
 class MP4VideoParser:
     """MP4 and QuickTime MOV video container carver."""
 
     FTYP = b'ftyp'
     VALID_BRANDS = {
         b'isom', b'iso2', b'mp41', b'mp42', b'qt  ', b'M4A ',
-        b'M4V ', b'avc1', b'MSNV', b'heic', b'mif1'
+        b'M4V ', b'avc1', b'MSNV'
     }
 
     @classmethod
@@ -295,7 +386,7 @@ class MP4VideoParser:
         if data[offset + 4:offset + 8] != cls.FTYP:
             return False
         brand = data[offset + 8:offset + 12]
-        return brand in cls.VALID_BRANDS or brand.isalnum()
+        return brand in cls.VALID_BRANDS or (brand.isalnum() and brand not in HEICParser.HEIC_BRANDS)
 
     @classmethod
     def parse_stream(cls, data: bytes, start: int, max_size: int = 500 * 1024 * 1024) -> Tuple[Optional[int], bool, Dict[str, Any]]:
@@ -347,6 +438,10 @@ class MultiFormatCarver:
             return MediaType.JPEG, "jpg"
         if PNGParser.is_valid_header(data, offset):
             return MediaType.PNG, "png"
+        if HEICParser.is_valid_header(data, offset):
+            return MediaType.HEIC, "heic"
+        if WebPParser.is_valid_header(data, offset):
+            return MediaType.WEBP, "webp"
         if TIFFRAWParser.is_valid_header(data, offset):
             ext = "cr2" if (len(data) - offset >= 12 and data[offset + 8:offset + 12] == TIFFRAWParser.CR2_SIG) else "tif"
             return MediaType.TIFF_RAW, ext
