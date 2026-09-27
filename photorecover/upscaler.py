@@ -1,47 +1,33 @@
 """
-AI-powered image upscaling module using Real-ESRGAN and other super-resolution models.
+AI Super-Resolution and Detail Enhancement Module
+Uses Real-ESRGAN / RRDBNet with verified weight management and aspect-ratio preserving scaling.
 """
 
 import os
 import cv2
 import numpy as np
 from pathlib import Path
-from typing import Optional, Union, Literal
+from typing import Optional, Union, Literal, Tuple
 import warnings
+from .models import ModelRegistry
+from .exceptions import ModelError
 
 
 class AIUpscaler:
     """
-    AI-powered image upscaler using Real-ESRGAN for high-quality 4K upscaling.
-    Falls back to traditional methods if AI models are unavailable.
+    AI-powered image super-resolution and restoration.
+    Maintains strict aspect ratio preservation and offers fallback to Lanczos + bilateral filtering.
     """
 
     def __init__(self, model_name: str = "RealESRGAN_x4plus", gpu_id: Optional[int] = 0):
-        """
-        Initialize the AI upscaler.
-
-        Args:
-            model_name: Name of the Real-ESRGAN model to use.
-                Options: RealESRGAN_x4plus, RealESRGAN_x4plus_anime_6B,
-                         RealESRNet_x4plus, RealESRGAN_x2plus
-            gpu_id: GPU device ID. Set to None for CPU mode.
-        """
         self.model_name = model_name
         self.gpu_id = gpu_id
         self.upsampler = None
         self._model_loaded = False
         self._load_error = None
 
-        # Model configurations
-        self.model_configs = {
-            "RealESRGAN_x4plus": {"scale": 4, "model_path": None},
-            "RealESRGAN_x4plus_anime_6B": {"scale": 4, "model_path": None},
-            "RealESRNet_x4plus": {"scale": 4, "model_path": None},
-            "RealESRGAN_x2plus": {"scale": 2, "model_path": None},
-        }
-
-    def _load_model(self):
-        """Load the Real-ESRGAN model."""
+    def _load_model(self) -> bool:
+        """Load the Real-ESRGAN model with checksum verification."""
         if self._model_loaded:
             return True
 
@@ -49,51 +35,33 @@ class AIUpscaler:
             from realesrgan import RealESRGANer
             from basicsr.archs.rrdbnet_arch import RRDBNet
 
-            if self.model_name == "RealESRGAN_x4plus":
-                model = RRDBNet(
-                    num_in_ch=3, num_out_ch=3, num_feat=64,
-                    num_block=23, num_grow_ch=32, scale=4
-                )
-                netscale = 4
-                model_url = "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth"
+            if self.model_name not in ModelRegistry.MODELS:
+                self.model_name = "RealESRGAN_x4plus"
 
-            elif self.model_name == "RealESRGAN_x4plus_anime_6B":
-                model = RRDBNet(
-                    num_in_ch=3, num_out_ch=3, num_feat=64,
-                    num_block=6, num_grow_ch=32, scale=4
-                )
-                netscale = 4
-                model_url = "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.2.4/RealESRGAN_x4plus_anime_6B.pth"
+            info = ModelRegistry.MODELS[self.model_name]
+            netscale = info["scale"]
 
-            elif self.model_name == "RealESRGAN_x2plus":
-                model = RRDBNet(
-                    num_in_ch=3, num_out_ch=3, num_feat=64,
-                    num_block=23, num_grow_ch=32, scale=2
-                )
-                netscale = 2
-                model_url = "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.1/RealESRGAN_x2plus.pth"
-
+            if info.get("arch") == "RRDBNet_6B":
+                model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=6, num_grow_ch=32, scale=netscale)
             else:
-                model = RRDBNet(
-                    num_in_ch=3, num_out_ch=3, num_feat=64,
-                    num_block=23, num_grow_ch=32, scale=4
-                )
-                netscale = 4
-                model_url = "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth"
+                model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=23, num_grow_ch=32, scale=netscale)
 
-            # Determine model path
-            model_dir = Path.home() / ".cache" / "photorecover" / "models"
-            model_dir.mkdir(parents=True, exist_ok=True)
-            model_path = model_dir / f"{self.model_name}.pth"
+            # Ensure model file is safely downloaded & verified
+            try:
+                model_path = ModelRegistry.ensure_model(self.model_name)
+            except Exception as dl_err:
+                self._load_error = f"Model download/verification failed: {dl_err}"
+                warnings.warn(self._load_error)
+                return False
 
             self.upsampler = RealESRGANer(
                 scale=netscale,
-                model_path=str(model_path) if model_path.exists() else model_url,
+                model_path=str(model_path),
                 model=model,
-                tile=0,  # No tiling for smaller images
+                tile=0,
                 tile_pad=10,
                 pre_pad=0,
-                half=False,  # Use full precision for better quality
+                half=False,
                 gpu_id=self.gpu_id
             )
 
@@ -101,251 +69,111 @@ class AIUpscaler:
             return True
 
         except ImportError as e:
-            self._load_error = f"Real-ESRGAN not available: {e}. Using fallback upscaling."
-            warnings.warn(self._load_error)
+            self._load_error = f"Real-ESRGAN/PyTorch not installed: {e}. Using high-quality algorithmic super-resolution."
             return False
 
         except Exception as e:
-            self._load_error = f"Failed to load AI model: {e}. Using fallback upscaling."
-            warnings.warn(self._load_error)
+            self._load_error = f"Failed to initialize AI model: {e}. Using algorithmic fallback."
             return False
 
-    def upscale(self, image: np.ndarray, scale: int = 4,
-                outscale: Optional[float] = None) -> np.ndarray:
+    def upscale(self, image: np.ndarray, scale: int = 4, outscale: Optional[float] = None) -> np.ndarray:
         """
-        Upscale image using AI super-resolution.
-
-        Args:
-            image: Input image as numpy array (RGB format)
-            scale: Upscaling factor (2 or 4)
-            outscale: Final output scale. If None, uses the model's native scale.
-
-        Returns:
-            Upscaled image as numpy array
+        Upscale image using AI super-resolution or Lanczos fallback.
+        Preserves original aspect ratio.
         """
         if outscale is None:
             outscale = float(scale)
 
-        # Try AI upscaling first
-        if self._load_model():
+        if self._load_model() and self.upsampler is not None:
             try:
-                # Convert RGB to BGR for Real-ESRGAN
                 image_bgr = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
-
-                # Upscale
                 output_bgr, _ = self.upsampler.enhance(image_bgr, outscale=outscale)
-
-                # Convert back to RGB
                 return cv2.cvtColor(output_bgr, cv2.COLOR_BGR2RGB)
-
             except Exception as e:
-                warnings.warn(f"AI upscaling failed: {e}. Using fallback.")
+                warnings.warn(f"AI execution error: {e}. Falling back to Lanczos.")
 
-        # Fallback to high-quality traditional upscaling
-        return self._fallback_upscale(image, scale)
+        return self._fallback_upscale(image, outscale)
 
-    def _fallback_upscale(self, image: np.ndarray, scale: int) -> np.ndarray:
+    def _fallback_upscale(self, image: np.ndarray, scale: float) -> np.ndarray:
         """
-        High-quality fallback upscaling using enhanced traditional methods.
-        Combines Lanczos interpolation with edge enhancement.
+        High-precision algorithmic fallback combining Lanczos-4 with edge preservation.
+        Strictly preserves aspect ratio.
         """
-        height, width = image.shape[:2]
-        new_size = (width * scale, height * scale)
+        h, w = image.shape[:2]
+        new_w = max(1, round(w * scale))
+        new_h = max(1, round(h * scale))
 
-        # Step 1: Upscale with Lanczos
-        upscaled = cv2.resize(image, new_size, interpolation=cv2.INTER_LANCZOS4)
+        # Lanczos-4 interpolation
+        upscaled = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)
 
-        # Step 2: Apply edge-aware sharpening
-        upscaled = self._edge_enhance(upscaled)
+        # Bilateral edge-preserving smoothing to reduce pixelation
+        upscaled = cv2.bilateralFilter(upscaled, d=5, sigmaColor=35, sigmaSpace=35)
 
-        # Step 3: Apply bilateral filter for smooth areas
-        upscaled = cv2.bilateralFilter(upscaled, 5, 50, 50)
+        # Subtle unsharp edge refinement
+        blurred = cv2.GaussianBlur(upscaled, (0, 0), 1.5)
+        sharpened = cv2.addWeighted(upscaled, 1.25, blurred, -0.25, 0)
 
-        # Step 4: Final sharpening pass
-        kernel = np.array([
-            [0, -1, 0],
-            [-1, 5, -1],
-            [0, -1, 0]
-        ], dtype=np.float32)
-        upscaled = cv2.filter2D(upscaled, -1, kernel)
+        return np.clip(sharpened, 0, 255).astype(np.uint8)
 
-        return np.clip(upscaled, 0, 255).astype(np.uint8)
-
-    def _edge_enhance(self, image: np.ndarray) -> np.ndarray:
-        """Enhance edges while preserving smooth areas."""
-        # Detect edges
-        gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
-        edges = cv2.Canny(gray, 50, 150)
-
-        # Dilate edges slightly
-        kernel = np.ones((3, 3), np.uint8)
-        edges = cv2.dilate(edges, kernel, iterations=1)
-
-        # Create edge mask
-        edge_mask = edges.astype(np.float32) / 255.0
-        edge_mask = np.stack([edge_mask] * 3, axis=-1)
-
-        # Apply unsharp mask more strongly to edge areas
-        blurred = cv2.GaussianBlur(image, (0, 0), 2)
-        sharpened = cv2.addWeighted(image, 1.5, blurred, -0.5, 0)
-
-        # Blend based on edge mask
-        result = image * (1 - edge_mask * 0.5) + sharpened * (edge_mask * 0.5)
-
-        return np.clip(result, 0, 255).astype(np.uint8)
-
-    def upscale_to_4k(self, image: np.ndarray) -> np.ndarray:
-        """
-        Upscale image to 4K resolution (3840x2160 minimum dimension).
-        Automatically calculates required scale factor.
-        """
-        height, width = image.shape[:2]
-
-        # Calculate scale needed for 4K
-        target_width = 3840
-        target_height = 2160
-
-        scale_w = target_width / width
-        scale_h = target_height / height
-
-        # Use the larger scale to ensure 4K minimum
-        scale = max(scale_w, scale_h)
-
-        # Round up to nearest supported scale
-        if scale <= 2:
-            scale = 2
-        elif scale <= 4:
-            scale = 4
-        else:
-            # For very small images, upscale in multiple passes
-            return self._multi_pass_upscale(image, target_width, target_height)
-
-        upscaled = self.upscale(image, scale=int(scale), outscale=scale)
-
-        # Resize to exact 4K if needed
-        h, w = upscaled.shape[:2]
-        if w < target_width or h < target_height:
-            # Calculate new dimensions maintaining aspect ratio
-            aspect = width / height
-            if aspect > target_width / target_height:
-                new_width = target_width
-                new_height = int(target_width / aspect)
-            else:
-                new_height = target_height
-                new_width = int(target_height * aspect)
-
-            upscaled = cv2.resize(upscaled, (new_width, new_height),
-                                  interpolation=cv2.INTER_LANCZOS4)
-
-        return upscaled
-
-    def upscale_to_resolution(self, image: np.ndarray,
+    def upscale_to_resolution(self,
+                              image: np.ndarray,
                               target_width: int,
                               target_height: int,
                               maintain_aspect: bool = True) -> np.ndarray:
         """
-        Upscale image to a specific resolution.
-
-        Args:
-            image: Input image
-            target_width: Target width in pixels
-            target_height: Target height in pixels
-            maintain_aspect: If True, maintains aspect ratio (uses larger dimension)
-
-        Returns:
-            Upscaled image
+        Upscales an image to a target resolution without distortion.
+        When maintain_aspect=True, fits image within (target_width, target_height)
+        preserving the exact original aspect ratio.
         """
-        height, width = image.shape[:2]
+        h, w = image.shape[:2]
+        if w == 0 or h == 0:
+            return image
 
         if maintain_aspect:
-            # Calculate scale to fit target while maintaining aspect
-            scale_w = target_width / width
-            scale_h = target_height / height
-            scale = max(scale_w, scale_h)
+            # Fit within bounding box
+            scale = min(target_width / w, target_height / h)
+            final_w = max(1, round(w * scale))
+            final_h = max(1, round(h * scale))
         else:
-            scale_w = target_width / width
-            scale_h = target_height / height
-            scale = (scale_w + scale_h) / 2
+            final_w = target_width
+            final_h = target_height
+            scale = max(target_width / w, target_height / h)
 
-        # Determine best upscale approach
-        if scale <= 1:
-            # No upscaling needed, just resize
-            return cv2.resize(image, (target_width, target_height),
-                              interpolation=cv2.INTER_LANCZOS4)
+        if scale <= 1.0:
+            # No enlargement needed
+            return cv2.resize(image, (final_w, final_h), interpolation=cv2.INTER_LANCZOS4)
 
-        # Upscale with AI
-        if scale <= 2:
-            upscaled = self.upscale(image, scale=2, outscale=scale)
-        elif scale <= 4:
-            upscaled = self.upscale(image, scale=4, outscale=scale)
-        else:
-            upscaled = self._multi_pass_upscale(image, target_width, target_height)
+        # Apply AI or fallback upscale
+        upscaled = self.upscale(image, scale=int(np.ceil(scale)), outscale=scale)
 
-        # Final resize to exact dimensions
-        if not maintain_aspect:
-            upscaled = cv2.resize(upscaled, (target_width, target_height),
-                                  interpolation=cv2.INTER_LANCZOS4)
+        # Ensure exact pixel dimension matching
+        if upscaled.shape[1] != final_w or upscaled.shape[0] != final_h:
+            upscaled = cv2.resize(upscaled, (final_w, final_h), interpolation=cv2.INTER_LANCZOS4)
 
         return upscaled
 
-    def _multi_pass_upscale(self, image: np.ndarray,
-                            target_width: int,
-                            target_height: int) -> np.ndarray:
+    def upscale_to_4k(self, image: np.ndarray) -> np.ndarray:
         """
-        Multi-pass upscaling for very small images that need >4x upscaling.
+        Upscales image to 4K class resolution (3840x2160 bounding envelope)
+        while strictly preserving the photograph's original aspect ratio.
         """
-        current = image.copy()
-        height, width = current.shape[:2]
-
-        while width < target_width or height < target_height:
-            # Upscale by 4x
-            current = self.upscale(current, scale=4)
-            height, width = current.shape[:2]
-
-            # Safety check to prevent infinite loop
-            if width >= target_width * 2 or height >= target_height * 2:
-                break
-
-        # Final resize to target
-        return cv2.resize(current, (target_width, target_height),
-                          interpolation=cv2.INTER_LANCZOS4)
+        return self.upscale_to_resolution(image, target_width=3840, target_height=2160, maintain_aspect=True)
 
     @staticmethod
     def get_available_models() -> list:
-        """Get list of available upscaling models."""
         return [
-            {
-                "name": "RealESRGAN_x4plus",
-                "scale": 4,
-                "description": "General purpose 4x upscaling, best for photos"
-            },
-            {
-                "name": "RealESRGAN_x4plus_anime_6B",
-                "scale": 4,
-                "description": "Optimized for anime/illustration images"
-            },
-            {
-                "name": "RealESRGAN_x2plus",
-                "scale": 2,
-                "description": "2x upscaling, faster processing"
-            },
-            {
-                "name": "RealESRNet_x4plus",
-                "scale": 4,
-                "description": "Alternative 4x model with different characteristics"
-            }
+            {"name": k, "scale": v["scale"], "description": v["description"]}
+            for k, v in ModelRegistry.MODELS.items()
         ]
 
     def is_ai_available(self) -> bool:
-        """Check if AI upscaling is available."""
         return self._load_model()
 
     def get_status(self) -> dict:
-        """Get upscaler status information."""
-        ai_available = self.is_ai_available()
+        ai_ok = self.is_ai_available()
         return {
             "model_name": self.model_name,
-            "ai_available": ai_available,
-            "gpu_enabled": self.gpu_id is not None and ai_available,
-            "error": self._load_error if not ai_available else None
+            "ai_available": ai_ok,
+            "gpu_enabled": self.gpu_id is not None and ai_ok,
+            "error": self._load_error if not ai_ok else None
         }
